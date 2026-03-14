@@ -9,11 +9,31 @@
 
 #include "KICachePolicy.h"
 
+/**
+ * @file KLfuCache.h
+ * @brief LFU（最不经常使用）缓存及其变体实现
+ *
+ * 该文件包含多种 LFU 缓存实现：
+ * 1. KLfuCache: 基础 LFU 缓存，使用频率哈希表和双向链表
+ * 2. KHashLfuCache: 分片 LFU 缓存，提高并发性能
+ *
+ * 支持频率衰减机制：当平均访问频率超过阈值时，所有节点的频率衰减一半。
+ * 所有实现均线程安全（使用互斥锁），并支持任意类型的键和值。
+ */
+
 namespace KamaCache
 {
 
 template<typename Key, typename Value> class KLfuCache;
 
+/**
+ * @class FreqList
+ * @brief 频率链表，用于管理同一访问频率的所有节点
+ *
+ * 每个 FreqList 对应一个特定的访问频率，包含该频率下的所有缓存节点。
+ * 使用双向链表组织节点，支持快速添加、删除和获取第一个节点。
+ * 是 LFU 缓存的核心数据结构之一。
+ */
 template<typename Key, typename Value>
 class FreqList
 {
@@ -82,6 +102,20 @@ public:
     friend class KLfuCache<Key, Value>;
 };
 
+/**
+ * @class KLfuCache
+ * @brief 基础 LFU（最不经常使用）缓存实现
+ *
+ * 实现经典的 LFU 缓存策略：当缓存满时，淘汰访问频率最低的项目。
+ * 使用多个频率链表（FreqList）组织节点，每个链表包含相同频率的节点。
+ * 支持频率衰减机制：当平均访问频率超过阈值时，所有节点的频率减半，
+ * 防止高频节点永久占据缓存。
+ *
+ * 特性：
+ * 1. 维护最小频率（minFreq_）以快速找到淘汰候选
+ * 2. 计算平均访问频率，超过阈值时触发衰减
+ * 3. 线程安全，所有公共操作使用互斥锁保护
+ */
 template <typename Key, typename Value>
 class KLfuCache : public KICachePolicy<Key, Value>
 {
@@ -90,13 +124,27 @@ public:
     using NodePtr = std::shared_ptr<Node>;
     using NodeMap = std::unordered_map<Key, NodePtr>;
 
+    /**
+     * @brief 构造一个 LFU 缓存对象
+     * @param capacity 缓存容量，必须大于 0
+     * @param maxAverageNum 最大平均访问频率阈值，超过此值会触发频率衰减
+     * @note 容量为 0 的缓存将拒绝所有添加操作
+     */
     KLfuCache(int capacity, int maxAverageNum = 1000000)
     : capacity_(capacity), minFreq_(INT8_MAX), maxAverageNum_(maxAverageNum),
-      curAverageNum_(0), curTotalNum_(0) 
+      curAverageNum_(0), curTotalNum_(0)
     {}
 
     ~KLfuCache() override = default;
 
+    /**
+     * @brief 向缓存中添加或更新键值对
+     * @param key 要添加或更新的键
+     * @param value 与键关联的值
+     * @note 如果键已存在，则更新其值并增加访问频率；
+     *       如果键不存在且缓存已满，则淘汰频率最低的节点后添加新节点。
+     *       线程安全。
+     */
     void put(Key key, Value value) override
     {
         if (capacity_ == 0)
@@ -116,7 +164,14 @@ public:
         putInternal(key, value);
     }
 
-    // value值为传出参数
+    /**
+     * @brief 从缓存中获取指定键的值（传出参数版本）
+     * @param key 要查找的键
+     * @param value 传出参数，用于接收找到的值
+     * @return true 如果键存在，value 被设置为对应的值，且节点的访问频率增加
+     * @return false 如果键不存在，value 保持不变
+     * @note 线程安全。如果键存在，会调用 getInternal 增加节点频率并调整位置
+     */
     bool get(Key key, Value& value) override
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -130,6 +185,13 @@ public:
       return false;
     }
 
+    /**
+     * @brief 从缓存中获取指定键的值（返回值版本）
+     * @param key 要查找的键
+     * @return Value 如果键存在则返回对应的值，否则返回默认构造的 Value 对象
+     * @note 内部调用 bool get(Key, Value&) 版本，如果键不存在会返回默认值
+     * @warning 对于非平凡类型，返回默认构造值可能有性能开销
+     */
     Value get(Key key) override
     {
       Value value;
@@ -137,7 +199,10 @@ public:
       return value;
     }
 
-      // 清空缓存,回收资源
+    /**
+     * @brief 清空缓存，释放所有资源
+     * @note 移除所有节点，清空哈希表和频率链表。线程安全。
+     */
     void purge()
     {
       nodeMap_.clear();
@@ -323,11 +388,25 @@ void KLfuCache<Key, Value>::updateMinFreq()
         minFreq_ = 1;
 }
 
-// 并没有牺牲空间换时间，他是把原有缓存大小进行了分片。
+/**
+ * @class KHashLfuCache
+ * @brief 分片哈希 LFU 缓存
+ *
+ * 将总缓存容量分成多个独立的 LFU 缓存分片，每个分片有自己的锁。
+ * 通过键的哈希值决定路由到哪个分片，从而减少锁竞争，提高并发性能。
+ * 适用于多线程高并发场景，但可能因哈希不均匀导致分片负载不平衡。
+ */
 template<typename Key, typename Value>
 class KHashLfuCache
 {
 public:
+    /**
+     * @brief 构造一个分片 LFU 缓存对象
+     * @param capacity 总缓存容量
+     * @param sliceNum 分片数量，如果为 0 则使用硬件并发线程数
+     * @param maxAverageNum 每个分片的最大平均访问频率阈值
+     * @note 总容量被均匀分配到各分片（向上取整），每个分片是一个独立的 KLfuCache 实例
+     */
     KHashLfuCache(size_t capacity, int sliceNum, int maxAverageNum = 10)
         : sliceNum_(sliceNum > 0 ? sliceNum : std::thread::hardware_concurrency())
         , capacity_(capacity)
@@ -339,6 +418,12 @@ public:
         }
     }
 
+    /**
+     * @brief 向缓存中添加或更新键值对
+     * @param key 要添加或更新的键
+     * @param value 与键关联的值
+     * @note 根据键的哈希值选择分片，然后调用对应分片的 put 方法
+     */
     void put(Key key, Value value)
     {
         // 根据key找出对应的lfu分片
@@ -346,6 +431,14 @@ public:
         lfuSliceCaches_[sliceIndex]->put(key, value);
     }
 
+    /**
+     * @brief 从缓存中获取指定键的值（传出参数版本）
+     * @param key 要查找的键
+     * @param value 传出参数，用于接收找到的值
+     * @return true 如果键存在，value 被设置为对应的值
+     * @return false 如果键不存在，value 保持不变
+     * @note 根据键的哈希值选择分片，然后调用对应分片的 get 方法
+     */
     bool get(Key key, Value& value)
     {
         // 根据key找出对应的lfu分片
@@ -353,6 +446,12 @@ public:
         return lfuSliceCaches_[sliceIndex]->get(key, value);
     }
 
+    /**
+     * @brief 从缓存中获取指定键的值（返回值版本）
+     * @param key 要查找的键
+     * @return Value 如果键存在则返回对应的值，否则返回默认构造的 Value 对象
+     * @note 内部调用 bool get(Key, Value&) 版本，如果键不存在会返回默认值
+     */
     Value get(Key key)
     {
         Value value;
@@ -360,7 +459,10 @@ public:
         return value;
     }
 
-    // 清除缓存
+    /**
+     * @brief 清空所有分片缓存，释放资源
+     * @note 遍历所有分片，调用每个分片的 purge() 方法。线程安全。
+     */
     void purge()
     {
         for (auto& lfuSliceCache : lfuSliceCaches_)

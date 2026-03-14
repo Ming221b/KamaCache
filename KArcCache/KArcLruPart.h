@@ -4,9 +4,25 @@
 #include <unordered_map>
 #include <mutex>
 
-namespace KamaCache 
+/**
+ * @file KArcLruPart.h
+ * @brief ARC 缓存中的 LRU 部分实现
+ *
+ * 管理 ARC 缓存中的 T1（最近访问一次）部分及其幽灵链表 B1。
+ * 提供 LRU 缓存的基本操作，并支持将频繁访问的节点转移到 LFU 部分。
+ */
+
+namespace KamaCache
 {
 
+/**
+ * @class ArcLruPart
+ * @brief ARC 缓存中的 LRU 部分（T1）及其幽灵链表（B1）
+ *
+ * 负责管理最近访问一次的条目（T1）和最近从 T1 淘汰的键（B1）。
+ * 当节点访问次数达到转换阈值时，标记为可转移到 LFU 部分。
+ * 淘汰的节点不会立即删除，而是进入幽灵链表 B1，用于自适应调整容量比例。
+ */
 template<typename Key, typename Value>
 class ArcLruPart 
 {
@@ -15,6 +31,12 @@ public:
     using NodePtr = std::shared_ptr<NodeType>;
     using NodeMap = std::unordered_map<Key, NodePtr>;
 
+    /**
+     * @brief 构造一个 ARC LRU 部分对象
+     * @param capacity 主链表（T1）容量
+     * @param transformThreshold 转换阈值，节点访问次数达到此值后可转移到 LFU 部分
+     * @note 幽灵链表（B1）容量与主链表相同，初始化时创建虚拟头尾节点
+     */
     explicit ArcLruPart(size_t capacity, size_t transformThreshold)
         : capacity_(capacity)
         , ghostCapacity_(capacity)
@@ -23,6 +45,14 @@ public:
         initializeLists();
     }
 
+    /**
+     * @brief 向 LRU 部分添加或更新键值对
+     * @param key 要添加或更新的键
+     * @param value 与键关联的值
+     * @return true 操作成功，false 容量为 0 无法添加
+     * @note 如果键已存在，则更新其值并移到链表头部；
+     *       如果键不存在且缓存已满，则淘汰最近最少使用的节点到幽灵链表。
+     */
     bool put(Key key, Value value) 
     {
         if (capacity_ == 0) return false;
@@ -36,6 +66,16 @@ public:
         return addNewNode(key, value);
     }
 
+    /**
+     * @brief 从 LRU 部分获取指定键的值
+     * @param key 要查找的键
+     * @param value 传出参数，用于接收找到的值
+     * @param shouldTransform 传出参数，指示该节点是否应转移到 LFU 部分
+     * @return true 如果键存在，value 被设置为对应的值
+     * @return false 如果键不存在，value 和 shouldTransform 保持不变
+     * @note 如果键存在，会将其移到链表头部并增加访问计数。
+     *       shouldTransform 为 true 表示节点访问次数达到转换阈值。
+     */
     bool get(Key key, Value& value, bool& shouldTransform) 
     {
         std::lock_guard<std::mutex> lock(mutex_);

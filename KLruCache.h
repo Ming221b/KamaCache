@@ -1,4 +1,16 @@
-#pragma once 
+#pragma once
+
+/**
+ * @file KLruCache.h
+ * @brief LRU（最近最少使用）缓存及其变体实现
+ *
+ * 该文件包含多种 LRU 缓存实现：
+ * 1. KLruCache: 基础 LRU 缓存，使用双向链表和哈希表
+ * 2. KLruKCache: LRU-K 缓存，考虑访问历史频率
+ * 3. KHashLruCaches: 分片 LRU 缓存，提高并发性能
+ *
+ * 所有实现均线程安全（使用互斥锁），并支持任意类型的键和值。
+ */
 
 #include <cstring>
 #include <list>
@@ -14,6 +26,13 @@ namespace KamaCache
 // 前向声明
 template<typename Key, typename Value> class KLruCache;
 
+/**
+ * @class LruNode
+ * @brief LRU 缓存中的节点类
+ *
+ * 表示 LRU 缓存中的一个条目，存储键、值、访问次数以及前后节点的指针。
+ * 使用 weak_ptr 指向前驱节点以避免循环引用，使用 shared_ptr 指向后继节点。
+ */
 template<typename Key, typename Value>
 class LruNode 
 {
@@ -42,6 +61,14 @@ public:
 };
 
 
+/**
+ * @class KLruCache
+ * @brief 基础 LRU（最近最少使用）缓存实现
+ *
+ * 实现经典的 LRU 缓存策略：当缓存满时，淘汰最近最少使用的项目。
+ * 使用双向链表维护访问顺序，哈希表提供 O(1) 的查找效率。
+ * 线程安全：所有公共操作均使用互斥锁保护。
+ */
 template<typename Key, typename Value>
 class KLruCache : public KICachePolicy<Key, Value>
 {
@@ -50,6 +77,11 @@ public:
     using NodePtr = std::shared_ptr<LruNodeType>;
     using NodeMap = std::unordered_map<Key, NodePtr>;
 
+    /**
+     * @brief 构造一个 LRU 缓存对象
+     * @param capacity 缓存容量，必须大于 0
+     * @note 容量为 0 或负数的缓存将拒绝所有添加操作
+     */
     KLruCache(int capacity)
         : capacity_(capacity)
     {
@@ -58,7 +90,14 @@ public:
 
     ~KLruCache() override = default;
 
-    // 添加缓存
+    /**
+     * @brief 向缓存中添加或更新键值对
+     * @param key 要添加或更新的键
+     * @param value 与键关联的值
+     * @note 如果键已存在，则更新其值并将节点移到最近使用位置；
+     *       如果键不存在且缓存已满，则淘汰最近最少使用的节点后添加新节点。
+     *       线程安全。
+     */
     void put(Key key, Value value) override
     {
         if (capacity_ <= 0)
@@ -76,6 +115,14 @@ public:
         addNewNode(key, value);
     }
 
+    /**
+     * @brief 从缓存中获取指定键的值（传出参数版本）
+     * @param key 要查找的键
+     * @param value 传出参数，用于接收找到的值
+     * @return true 如果键存在，value 被设置为对应的值，且节点被移到最近使用位置
+     * @return false 如果键不存在，value 保持不变
+     * @note 线程安全。如果键存在，会更新节点的访问时间（移到链表头部）
+     */
     bool get(Key key, Value& value) override
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -89,6 +136,13 @@ public:
         return false;
     }
 
+    /**
+     * @brief 从缓存中获取指定键的值（返回值版本）
+     * @param key 要查找的键
+     * @return Value 如果键存在则返回对应的值，否则返回默认构造的 Value 对象
+     * @note 内部调用 bool get(Key, Value&) 版本，如果键不存在会返回默认值
+     * @warning 对于非平凡类型，返回默认构造值可能有性能开销
+     */
     Value get(Key key) override
     {
         Value value{};
@@ -97,7 +151,12 @@ public:
         return value;
     }
 
-    // 删除指定元素
+    /**
+     * @brief 从缓存中删除指定键的条目
+     * @param key 要删除的键
+     * @note 如果键存在，则从链表和哈希表中移除对应节点；如果键不存在，则不执行任何操作。
+     *       线程安全。
+     */
     void remove(Key key) 
     {   
         std::lock_guard<std::mutex> lock(mutex_);
@@ -180,11 +239,29 @@ private:
     NodePtr       dummyTail_;
 };
 
-// LRU优化：Lru-k版本。 通过继承的方式进行再优化
+/**
+ * @class KLruKCache
+ * @brief LRU-K 缓存实现
+ *
+ * LRU-K 算法是 LRU 的改进，不仅考虑最近访问时间，还考虑访问频率。
+ * 维护一个访问历史记录，只有访问次数达到 K 次的项才会进入主缓存。
+ * 适用于访问模式具有“频率特征”的场景，能更好地抵抗突发流量干扰。
+ *
+ * 工作原理：
+ * 1. 每个键的访问次数被记录在单独的 LRU 缓存中（历史记录）
+ * 2. 当访问次数达到 K 时，该键及其值被提升到主 LRU 缓存
+ * 3. 主缓存满时仍按 LRU 策略淘汰
+ */
 template<typename Key, typename Value>
 class KLruKCache : public KLruCache<Key, Value>
 {
 public:
+    /**
+     * @brief 构造一个 LRU-K 缓存对象
+     * @param capacity 主缓存容量
+     * @param historyCapacity 历史记录缓存容量（存储访问次数）
+     * @param k 阈值 K，访问次数达到此值后条目才进入主缓存
+     */
     KLruKCache(int capacity, int historyCapacity, int k)
         : KLruCache<Key, Value>(capacity) // 调用基类构造
         , historyList_(std::make_unique<KLruCache<Key, size_t>>(historyCapacity))
@@ -271,7 +348,14 @@ private:
     std::unordered_map<Key, Value>          historyValueMap_; // 存储未达到k次访问的数据值
 };
 
-// lru优化：对lru进行分片，提高高并发使用的性能
+/**
+ * @class KHashLruCaches
+ * @brief 分片哈希 LRU 缓存
+ *
+ * 将总缓存容量分成多个独立的 LRU 缓存分片，每个分片有自己的锁。
+ * 通过键的哈希值决定路由到哪个分片，从而减少锁竞争，提高并发性能。
+ * 适用于多线程高并发场景，但可能因哈希不均匀导致分片负载不平衡。
+ */
 template<typename Key, typename Value>
 class KHashLruCaches
 {

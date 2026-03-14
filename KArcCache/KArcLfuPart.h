@@ -5,9 +5,26 @@
 #include <map>
 #include <mutex>
 
-namespace KamaCache 
+/**
+ * @file KArcLfuPart.h
+ * @brief ARC 缓存中的 LFU 部分实现
+ *
+ * 管理 ARC 缓存中的 T2（频繁访问）部分及其幽灵链表 B2。
+ * 使用频率哈希表（map<频率, 链表>）组织节点，支持快速找到最小频率节点。
+ */
+
+namespace KamaCache
 {
 
+/**
+ * @class ArcLfuPart
+ * @brief ARC 缓存中的 LFU 部分（T2）及其幽灵链表（B2）
+ *
+ * 负责管理频繁访问的条目（T2）和最近从 T2 淘汰的键（B2）。
+ * 使用频率映射（FreqMap）组织节点，每个频率对应一个链表。
+ * 维护最小频率（minFreq_）以快速找到淘汰候选。
+ * 淘汰的节点进入幽灵链表 B2，用于自适应调整容量比例。
+ */
 template<typename Key, typename Value>
 class ArcLfuPart 
 {
@@ -17,6 +34,13 @@ public:
     using NodeMap = std::unordered_map<Key, NodePtr>;
     using FreqMap = std::map<size_t, std::list<NodePtr>>;
 
+    /**
+     * @brief 构造一个 ARC LFU 部分对象
+     * @param capacity 主链表（T2）容量
+     * @param transformThreshold 转换阈值（保留参数，与 LRU 部分保持一致）
+     * @note 幽灵链表（B2）容量与主链表相同，初始化时创建虚拟头尾节点。
+     *       最小频率（minFreq_）初始化为 0，添加第一个节点后更新为 1。
+     */
     explicit ArcLfuPart(size_t capacity, size_t transformThreshold)
         : capacity_(capacity)
         , ghostCapacity_(capacity)
@@ -26,6 +50,14 @@ public:
         initializeLists();
     }
 
+    /**
+     * @brief 向 LFU 部分添加或更新键值对
+     * @param key 要添加或更新的键
+     * @param value 与键关联的值
+     * @return true 操作成功，false 容量为 0 无法添加
+     * @note 如果键已存在，则更新其值并增加频率；
+     *       如果键不存在且缓存已满，则淘汰频率最低的节点到幽灵链表。
+     */
     bool put(Key key, Value value) 
     {
         if (capacity_ == 0) 
@@ -40,6 +72,14 @@ public:
         return addNewNode(key, value);
     }
 
+    /**
+     * @brief 从 LFU 部分获取指定键的值
+     * @param key 要查找的键
+     * @param value 传出参数，用于接收找到的值
+     * @return true 如果键存在，value 被设置为对应的值
+     * @return false 如果键不存在，value 保持不变
+     * @note 如果键存在，会增加节点的访问频率并调整在频率链表中的位置。
+     */
     bool get(Key key, Value& value) 
     {
         std::lock_guard<std::mutex> lock(mutex_);
